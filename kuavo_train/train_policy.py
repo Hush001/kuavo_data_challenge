@@ -1,6 +1,8 @@
 import lerobot_patches.custom_patches  # Ensure custom patches are applied, DON'T REMOVE THIS LINE!
 from lerobot.configs.policies import PolicyFeature
 from typing import Any
+import math
+import os
 
 import hydra
 from omegaconf import DictConfig, OmegaConf, ListConfig
@@ -8,6 +10,9 @@ from pathlib import Path
 from functools import partial
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
 from torch.utils.data import DataLoader
 from tqdm import tqdm
@@ -73,13 +78,14 @@ def build_delta_timestamps(dataset_metadata, policy_cfg):
     return delta_timestamps if delta_timestamps else None
 
 
-def build_optimizer_and_scheduler(policy, cfg, total_frames):
+def build_optimizer_and_scheduler(policy, cfg, total_frames, world_size: int):
     """Return optimizer and scheduler."""
     optimizer = policy.config.get_optimizer_preset().build(policy.parameters())
-    # If `max_training_step` is specified, it takes precedence; 
+    # If `max_training_step` is specified, it takes precedence;
     # otherwise, the value is automatically determined based on `max_epoch`.
     if cfg.training.max_training_step is None:
-        updates_per_epoch = (total_frames // (cfg.training.batch_size * cfg.training.accumulation_steps)) + 1
+        effective_batch = cfg.training.batch_size * cfg.training.accumulation_steps * world_size
+        updates_per_epoch = math.ceil(total_frames / max(effective_batch, 1))
         num_training_steps = cfg.training.max_epoch * updates_per_epoch
     else:
         num_training_steps = cfg.training.max_training_step
@@ -156,14 +162,28 @@ def build_policy_config(cfg, input_features, output_features):
 
 @hydra.main(config_path="../configs/policy/", config_name="diffusion_config", version_base=None)
 def main(cfg: DictConfig):
+    distributed = dist.is_available() and int(os.environ.get("WORLD_SIZE", "1")) > 1
+    rank = int(os.environ.get("RANK", "0")) if distributed else 0
+    local_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0"))) if distributed else 0
+
+    if distributed:
+        backend = "nccl" if torch.cuda.is_available() else "gloo"
+        dist.init_process_group(backend=backend, init_method="env://")
+
+    device = torch.device("cuda", local_rank) if torch.cuda.is_available() else torch.device("cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(local_rank)
+        cfg.training.device = str(device)
+
     set_seed(cfg.training.seed)
 
     # Setup output directory
     output_directory = Path(cfg.training.output_directory) / f"run_{cfg.timestamp}"
-    output_directory.mkdir(parents=True, exist_ok=True)
-    writer = SummaryWriter(log_dir=str(output_directory))
-
-    device = torch.device(cfg.training.device)
+    if rank == 0:
+        output_directory.mkdir(parents=True, exist_ok=True)
+    if distributed:
+        dist.barrier()
+    writer = SummaryWriter(log_dir=str(output_directory)) if rank == 0 else None
 
     # Dataset metadata and features
     dataset_metadata = LeRobotDatasetMetadata(cfg.repoid, root=cfg.root)
@@ -182,8 +202,15 @@ def main(cfg: DictConfig):
     print("policy_cfg", policy_cfg)
 
     # Build policy
+    world_size = dist.get_world_size() if distributed else 1
+    total_batch_size = cfg.training.batch_size
+    per_device_batch_size = max(1, math.ceil(total_batch_size / world_size))
+    cfg.training.batch_size = per_device_batch_size
+    if rank == 0 and distributed:
+        print(f"Total batch size: {total_batch_size}, per-device batch size: {per_device_batch_size}, world size: {world_size}")
+
     policy = build_policy(cfg.policy_name, policy_cfg, dataset_stats=dataset_metadata.stats)
-    optimizer, lr_scheduler = build_optimizer_and_scheduler(policy, cfg, dataset_metadata.info["total_frames"])
+    optimizer, lr_scheduler = build_optimizer_and_scheduler(policy, cfg, dataset_metadata.info["total_frames"], world_size)
     
     # Initialize AMP GradScaler if use_amp is True
     amp_requested = bool(getattr(cfg.policy, "use_amp", False))
@@ -211,54 +238,89 @@ def main(cfg: DictConfig):
     best_loss = float('inf')
 
     # ===== Resume logic (perfect resume for AMP & RNG) =====
-    
+
     if cfg.training.resume and cfg.training.resume_timestamp:
         resume_path = Path(cfg.training.output_directory) / cfg.training.resume_timestamp
-        print("Resuming from:", resume_path)
+        if rank == 0:
+            print("Resuming from:", resume_path)
         try:
-            # Load RNG state
-            load_rng_state(resume_path / "rng_state.pth")
-            
-            # Load policy
-            policy = policy.from_pretrained(resume_path, strict=True)
+            checkpoint = None
+            if rank == 0:
+                # Load RNG state
+                load_rng_state(resume_path / "rng_state.pth")
 
-            """ Warning: using `from_pretrained` creates a new policy instance, 
-            so the optimizer must be reinitialized here! """
-            optimizer, lr_scheduler = build_optimizer_and_scheduler(policy, cfg, dataset_metadata.info["total_frames"])
-            
-            # Load optimizer, scheduler, scaler and training state
-            checkpoint = torch.load(resume_path / "learning_state.pth", map_location=device)
-            optimizer.load_state_dict(checkpoint["optimizer"])
-            
-            if "lr_scheduler" in checkpoint:
-                lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
-            
-            if "scaler" in checkpoint and amp_enabled:
-                scaler.load_state_dict(checkpoint["scaler"])
-            
-            if "steps" in checkpoint:
-                steps = checkpoint["steps"]
-            
-            if "epoch" in checkpoint:
-                start_epoch = checkpoint["epoch"]
-            
-            if "best_loss" in checkpoint:
-                best_loss = checkpoint["best_loss"]
-            
-            # Copy and load log_event
-            for file in resume_path.glob("events.*"):
-                shutil.copy(file, output_directory)
-                
-            print(f"Resumed training from epoch {start_epoch}, step {steps}")
+                # Load policy
+                policy = policy.from_pretrained(resume_path, strict=True)
+
+                """ Warning: using `from_pretrained` creates a new policy instance,
+                so the optimizer must be reinitialized here! """
+                optimizer, lr_scheduler = build_optimizer_and_scheduler(policy, cfg, dataset_metadata.info["total_frames"], world_size)
+
+                # Load optimizer, scheduler, scaler and training state
+                checkpoint = torch.load(resume_path / "learning_state.pth", map_location=device)
+            if distributed:
+                dist.barrier()
+
+            if distributed:
+                state_payload = [
+                    policy.state_dict() if rank == 0 else None,
+                    optimizer.state_dict() if rank == 0 else None,
+                    lr_scheduler.state_dict() if rank == 0 else None,
+                    checkpoint if rank == 0 else None,
+                ]
+                dist.broadcast_object_list(state_payload, src=0)
+                state_dict, optimizer_state, lr_scheduler_state, checkpoint = state_payload
+                policy.load_state_dict(state_dict)
+                optimizer.load_state_dict(optimizer_state)
+                if lr_scheduler_state is not None:
+                    lr_scheduler.load_state_dict(lr_scheduler_state)
+            else:
+                optimizer.load_state_dict(checkpoint["optimizer"])
+                if "lr_scheduler" in checkpoint:
+                    lr_scheduler.load_state_dict(checkpoint["lr_scheduler"])
+
+            if checkpoint is not None:
+                if "scaler" in checkpoint and amp_enabled:
+                    scaler.load_state_dict(checkpoint["scaler"])
+
+                if "steps" in checkpoint:
+                    steps = checkpoint["steps"]
+
+                if "epoch" in checkpoint:
+                    start_epoch = checkpoint["epoch"]
+
+                if "best_loss" in checkpoint:
+                    best_loss = checkpoint["best_loss"]
+
+                if rank == 0:
+                    for file in resume_path.glob("events.*"):
+                        shutil.copy(file, output_directory)
+
+            if distributed:
+                dist.barrier()
+
+            if rank == 0:
+                print(f"Resumed training from epoch {start_epoch}, step {steps}")
         except Exception as e:
-            print("Failed to load checkpoint:", e)
+            if rank == 0:
+                print("Failed to load checkpoint:", e)
             return
     else:
-        print("Training from scratch!")
+        if rank == 0:
+            print("Training from scratch!")
 
-    policy.train().to(device)
-    print(f"Total parameters: {sum(p.numel() for p in policy.parameters()):,}")
-    print(f"Using AMP: {amp_enabled}")
+    policy.to(device)
+    policy.train()
+    if distributed:
+        policy = DDP(
+            policy,
+            device_ids=[local_rank] if device.type == "cuda" else None,
+            output_device=local_rank if device.type == "cuda" else None,
+            find_unused_parameters=getattr(cfg.training, "find_unused_parameters", False),
+        )
+    if rank == 0:
+        print(f"Total parameters: {sum(p.numel() for p in policy.parameters()):,}")
+        print(f"Using AMP: {amp_enabled}")
     # Build dataset and dataloader
     delta_timestamps = build_delta_timestamps(dataset_metadata, policy_cfg)
 
@@ -271,18 +333,36 @@ def main(cfg: DictConfig):
     )
 
     # Training loop
-    for epoch in range(start_epoch, cfg.training.max_epoch):
-        dataloader = DataLoader(
+    sampler = None
+    if distributed:
+        sampler = DistributedSampler(
             dataset,
-            num_workers=cfg.training.num_workers,
-            batch_size=cfg.training.batch_size,
+            num_replicas=world_size,
+            rank=rank,
             shuffle=True,
-            pin_memory=(device.type != "cpu"),
             drop_last=cfg.training.drop_last,
-            prefetch_factor=1,
         )
 
-        epoch_bar = tqdm(dataloader, desc=f"Epoch {epoch+1}/{cfg.training.max_epoch}")
+    dataloader = DataLoader(
+        dataset,
+        num_workers=cfg.training.num_workers,
+        batch_size=cfg.training.batch_size,
+        shuffle=False,
+        sampler=sampler,
+        pin_memory=(device.type != "cpu"),
+        drop_last=cfg.training.drop_last,
+        prefetch_factor=1,
+    )
+
+    for epoch in range(start_epoch, cfg.training.max_epoch):
+        if sampler is not None:
+            sampler.set_epoch(epoch)
+
+        epoch_bar = tqdm(
+            dataloader,
+            desc=f"Epoch {epoch+1}/{cfg.training.max_epoch}",
+            disable=rank != 0,
+        )
 
         total_loss = 0.0
         for batch in epoch_bar:
@@ -298,7 +378,7 @@ def main(cfg: DictConfig):
             else:
                 scaled_loss.backward()
 
-            if steps % cfg.training.accumulation_steps == 0:
+            if (steps + 1) % cfg.training.accumulation_steps == 0:
                 if amp_enabled:
                     # Optionally unscale and clip gradients here if you use clipping
                     scaler.step(optimizer)
@@ -306,41 +386,54 @@ def main(cfg: DictConfig):
                 else:
                     optimizer.step()
                 optimizer.zero_grad()
-                lr_scheduler.step()
+                if lr_scheduler is not None:
+                    lr_scheduler.step()
 
-            if steps % cfg.training.log_freq == 0:
+            if writer and steps % cfg.training.log_freq == 0:
                 writer.add_scalar("train/loss", scaled_loss.item(), steps)
-                writer.add_scalar("train/lr", lr_scheduler.get_last_lr()[0], steps)
-                epoch_bar.set_postfix(loss=f"{scaled_loss.item():.3f}", step=steps, lr=lr_scheduler.get_last_lr()[0])
+                if lr_scheduler is not None:
+                    writer.add_scalar("train/lr", lr_scheduler.get_last_lr()[0], steps)
+                epoch_bar.set_postfix(
+                    loss=f"{scaled_loss.item():.3f}",
+                    step=steps,
+                    lr=lr_scheduler.get_last_lr()[0] if lr_scheduler is not None else None,
+                )
 
             steps += 1
             total_loss += scaled_loss.item()
-        
+
         # Update best loss
-        if total_loss < best_loss:
-            best_loss = total_loss
-            # Save best model
-            policy.save_pretrained(output_directory / "best")
-        # Save checkpoint every N epochs
-        if (epoch + 1) % cfg.training.save_freq_epoch == 0:
-            policy.save_pretrained(output_directory / f"epoch{epoch+1}")
+        if rank == 0:
+            if total_loss < best_loss:
+                best_loss = total_loss
+                # Save best model
+                (policy.module if isinstance(policy, DDP) else policy).save_pretrained(output_directory / "best")
+            # Save checkpoint every N epochs
+            if (epoch + 1) % cfg.training.save_freq_epoch == 0:
+                (policy.module if isinstance(policy, DDP) else policy).save_pretrained(output_directory / f"epoch{epoch+1}")
 
-        # Save last checkpoint (includes AMP scaler & progress for perfect resume)
-        # Save last checkpoint
-        policy.save_pretrained(output_directory)
-        # Save training state including optimizer, scheduler, scaler, and step/epoch info
-        checkpoint = {
-            "optimizer": optimizer.state_dict(),
-            "lr_scheduler": lr_scheduler.state_dict(),
-            "scaler": scaler.state_dict() if amp_enabled else None,
-            "steps": steps,
-            "epoch": epoch + 1,
-            "best_loss": best_loss
-        }
-        torch.save(checkpoint, output_directory / "learning_state.pth")
-        save_rng_state(output_directory / "rng_state.pth")
+            # Save last checkpoint (includes AMP scaler & progress for perfect resume)
+            (policy.module if isinstance(policy, DDP) else policy).save_pretrained(output_directory)
+            # Save training state including optimizer, scheduler, scaler, and step/epoch info
+            checkpoint = {
+                "optimizer": optimizer.state_dict(),
+                "lr_scheduler": lr_scheduler.state_dict() if lr_scheduler is not None else None,
+                "scaler": scaler.state_dict() if amp_enabled else None,
+                "steps": steps,
+                "epoch": epoch + 1,
+                "best_loss": best_loss
+            }
+            torch.save(checkpoint, output_directory / "learning_state.pth")
+            save_rng_state(output_directory / "rng_state.pth")
 
-    writer.close()
+        if distributed:
+            dist.barrier()
+
+    if writer:
+        writer.close()
+
+    if distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
