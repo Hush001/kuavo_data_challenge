@@ -10,7 +10,7 @@
    ```
 3. 确保 `PYTHONPATH` 包含项目根目录和 `third_party/lerobot/src`：
    ```bash
-   export PYTHONPATH="$(pwd)/third_party/lerobot/src:$(pwd):$PYTHONPATH"
+   export PYTHONPATH="/share/home/u21020/krm/leju/kuavo_data_challenge/third_party/lerobot/src:/share/home/u21020/krm/leju/kuavo_data_challenge:$PYTHONPATH"
    ```
 
 ## 2. 关键配置（已写入 `configs/policy/act_config.yaml`）
@@ -55,7 +55,7 @@ MASTER_PORT=29500
 torchrun \
   --nproc_per_node=$NUM_GPUS \
   --master_port=$MASTER_PORT \
-  kuavo_train/train_policy.py \
+  train_policy.py \
   policy_name=act \
   training.batch_size=64 \
   training.max_epoch=3000 \
