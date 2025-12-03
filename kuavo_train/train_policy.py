@@ -160,7 +160,7 @@ def build_policy_config(cfg, input_features, output_features):
 
 
 
-@hydra.main(config_path="../configs/policy/", config_name="diffusion_config", version_base=None)
+@hydra.main(config_path="../configs/policy/", config_name="act_config", version_base=None)
 def main(cfg: DictConfig):
     distributed = dist.is_available() and int(os.environ.get("WORLD_SIZE", "1")) > 1
     rank = int(os.environ.get("RANK", "0")) if distributed else 0
@@ -186,7 +186,13 @@ def main(cfg: DictConfig):
     writer = SummaryWriter(log_dir=str(output_directory)) if rank == 0 else None
 
     # Dataset metadata and features
-    dataset_metadata = LeRobotDatasetMetadata(cfg.repoid, root=cfg.root)
+    repoid = cfg.repoid
+    if isinstance(repoid, str):
+        # Allow passing a CLI string such as "['lerobot1-200','lerobot201-400']"
+        # to make torchrun parameter forwarding easier in SLURM scripts.
+        repoid = OmegaConf.create({"repoid": repoid}).repoid
+
+    dataset_metadata = LeRobotDatasetMetadata(repoid, root=cfg.root)
     print("camera_keys:", dataset_metadata.camera_keys)
     print("Original dataset features:", dataset_metadata.features)
 
@@ -326,7 +332,7 @@ def main(cfg: DictConfig):
 
     image_transforms = build_augmenter(cfg.training.RGB_Augmenter)
     dataset = LeRobotDataset(
-        cfg.repoid,
+        repoid,
         delta_timestamps=delta_timestamps,
         root=cfg.root,
         image_transforms=image_transforms,

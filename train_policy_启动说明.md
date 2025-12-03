@@ -10,7 +10,7 @@
    ```
 3. 确保 `PYTHONPATH` 包含项目根目录和 `third_party/lerobot/src`：
    ```bash
-   export PYTHONPATH="/share/home/u21020/krm/leju/kuavo_data_challenge/third_party/lerobot/src:/share/home/u21020/krm/leju/kuavo_data_challenge:$PYTHONPATH"
+   export PYTHONPATH="$(pwd)/third_party/lerobot/src:$(pwd):$PYTHONPATH"
    ```
 
 ## 2. 关键配置（已写入 `configs/policy/act_config.yaml`）
@@ -21,6 +21,7 @@
 - `training.output_directory`: `outputs`
 - `training.resume`: `true`，`training.resume_timestamp`: `run_xxxx`
 - `repoid`: `['lerobot1-200', 'lerobot201-400', ... , 'lerobot1801-2000']`
+  - 支持在命令行里传入字符串形式（例：`repoid="['lerobot1-200','lerobot201-400']"`），脚本会自动解析为列表。
 - `root`: `/ssdfs/datahome/u21020/1`
 - `hydra.run.dir`: `.`（日志和配置保存在当前运行目录）
 
@@ -44,7 +45,7 @@
 如需调整数据路径或重训策略，可直接编辑 `configs/policy/act_config.yaml`。
 
 ## 3. 启动命令示例
-以下命令与 `train.sh` 保持一致，可在项目根目录执行：
+以下命令与 `train.sh` 保持一致，可在项目根目录执行（脚本路径位于 `kuavo_train/train_policy.py`，默认加载 `configs/policy/act_config.yaml`）：
 ```bash
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)
@@ -54,7 +55,7 @@ MASTER_PORT=29500
 torchrun \
   --nproc_per_node=$NUM_GPUS \
   --master_port=$MASTER_PORT \
-  train_policy.py \
+  kuavo_train/train_policy.py \
   policy_name=act \
   training.batch_size=64 \
   training.max_epoch=3000 \
