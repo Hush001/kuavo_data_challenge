@@ -21,13 +21,31 @@
 - `training.output_directory`: `outputs`
 - `training.resume`: `true`，`training.resume_timestamp`: `run_xxxx`
 - `repoid`: `['lerobot1-200', 'lerobot201-400', ... , 'lerobot1801-2000']`
+  - 支持在命令行里传入字符串形式（例：`repoid="['lerobot1-200','lerobot201-400']"`），脚本会自动解析为列表。
 - `root`: `/ssdfs/datahome/u21020/1`
 - `hydra.run.dir`: `.`（日志和配置保存在当前运行目录）
+
+### 如何设置本地数据目录
+`root` 需要指向**包含所有分片目录的上级路径**，每个分片形如：
+
+```
+/ssdfs/datahome/u21020/1/
+  ├─ lerobot1-200/
+  │   └─ lerobot/
+  │       ├─ data/
+  │       ├─ images/
+  │       └─ meta/
+  ├─ lerobot201-400/
+  │   └─ lerobot/...
+  └─ ...
+```
+
+只要把 `root` 设置成 `lerobot*` 分片的共同父目录即可，例如你的数据结构可以直接使用 `root: /ssdfs/datahome/u21020/1`。如有自定义路径，保持同样的层级（`<root>/<分片名>/lerobot/{data,images,meta}`）即可被正确读取。
 
 如需调整数据路径或重训策略，可直接编辑 `configs/policy/act_config.yaml`。
 
 ## 3. 启动命令示例
-以下命令与 `train.sh` 保持一致，可在项目根目录执行：
+以下命令与 `train.sh` 保持一致，可在项目根目录执行（脚本路径位于 `kuavo_train/train_policy.py`，默认加载 `configs/policy/act_config.yaml`）：
 ```bash
 export CUDA_VISIBLE_DEVICES="0,1,2,3"
 NUM_GPUS=$(echo $CUDA_VISIBLE_DEVICES | tr ',' '\n' | wc -l)

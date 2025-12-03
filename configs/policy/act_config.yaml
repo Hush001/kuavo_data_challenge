@@ -11,7 +11,7 @@ method: "act"  # 自定义方法名称，与 POLICY_NAME=act 对齐
 timestamp: ${now:%Y%m%d_%H%M%S}  # 自动获取的运行时时间戳
 # 训练时模型参数的保存目录在outputs/train/<task>/<method>/<timestamp>中
 repoid: ["lerobot1-200", "lerobot201-400", "lerobot401-600", "lerobot601-800", "lerobot801-1000", "lerobot1001-1200", "lerobot1201-1400", "lerobot1401-1600", "lerobot1601-1800", "lerobot1801-2000"]  # train.sh 中自动生成的分片数据集列表
-root: "/ssdfs/datahome/u21020/1"  # 你的本地转换好的lerobot数据的目录
+root: "/ssdfs/datahome/u21020/1"  # 指向包含各分片（如 lerobot1-200/lerobot/{data,images,meta}）的上级目录
 # root: null  # 如果不使用本地数据想使用huggingface官方数据，请在task中指定，例如pusht，aloha_sim_insertion_human，此处就设置为null空
 # 将去云端调用下载数据集
 
