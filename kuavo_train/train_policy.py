@@ -14,7 +14,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 from torch.utils.tensorboard import SummaryWriter
-from torch.utils.data import DataLoader
+from torch.utils.data import ConcatDataset, DataLoader
 from tqdm import tqdm
 import shutil
 from hydra.utils import instantiate
@@ -35,6 +35,52 @@ from utils.transforms import ImageTransforms, ImageTransformsConfig, ImageTransf
 
 from functools import partial
 from contextlib import nullcontext
+def _normalize_repo_ids(repoid: Any) -> list[str]:
+    """Normalize repo id configuration into a list of strings."""
+
+    if isinstance(repoid, str):
+        return [repoid]
+    if isinstance(repoid, ListConfig):
+        return list(repoid)
+    if isinstance(repoid, (list, tuple)):
+        return [str(r) for r in repoid]
+
+    raise TypeError(f"Unsupported repoid type: {type(repoid)}")
+
+
+def _resolve_local_repo_root(root: str | Path | None, repo_id: str) -> Path | None:
+    """Resolve the on-disk root for a repo.
+
+    The upstream LeRobot loaders expect ``root`` to point at the directory
+    containing ``data``, ``images`` and ``meta``. When users keep multiple
+    shards together, they often set ``root`` to the parent directory (e.g.,
+    ``/ssdfs/.../1``) and place each shard under ``<root>/<repo_id>/lerobot``.
+
+    This helper searches a few common layouts and returns the first one that
+    contains ``meta/info.json``. If nothing exists locally, ``None`` is
+    returned so the default HuggingFace download path can be used instead.
+    """
+
+    if root is None:
+        return None
+
+    root = Path(root)
+    candidate_roots = [
+        root,
+        root / repo_id,
+        root / repo_id / "lerobot",
+    ]
+
+    info_relpath = Path("meta") / "info.json"
+    for candidate in candidate_roots:
+        if (candidate / info_relpath).exists():
+            return candidate
+
+    searched = [str(p) for p in candidate_roots]
+    raise FileNotFoundError(
+        f"Could not find meta/info.json for repo '{repo_id}'. Tried: {searched}. "
+        "If you intended to download from HuggingFace, leave `root` unset."
+    )
 
 
 def build_augmenter(cfg):
@@ -152,10 +198,58 @@ def build_policy_config(cfg, input_features, output_features):
         output_features=output_features,
         device=cfg.training.device,
     )
-                
+
     policy_cfg.input_features = _normalize_feature_dict(policy_cfg.input_features)
     policy_cfg.output_features = _normalize_feature_dict(policy_cfg.output_features)
     return policy_cfg
+
+
+
+def load_dataset_metadata(repo_ids: list[str], root: str | Path | None):
+    """Load and optionally merge metadata across multiple datasets."""
+
+    metadata_list = []
+    for repo_id in repo_ids:
+        resolved_root = _resolve_local_repo_root(root, repo_id)
+        metadata_list.append(LeRobotDatasetMetadata(repo_id, root=resolved_root))
+    if len(metadata_list) == 1:
+        return metadata_list[0]
+
+    base = metadata_list[0]
+    for meta in metadata_list[1:]:
+        if meta.features != base.features:
+            raise ValueError("All datasets must share identical feature definitions when using multiple repo_ids.")
+        if getattr(meta, "stats", None) != getattr(base, "stats", None):
+            raise ValueError("All datasets must share identical stats when using multiple repo_ids.")
+        if meta.fps != base.fps:
+            raise ValueError("All datasets must use the same FPS when using multiple repo_ids.")
+        if meta.camera_keys != base.camera_keys:
+            raise ValueError("All datasets must share identical camera keys when using multiple repo_ids.")
+
+    combined_info = dict(base.info)
+    for key in ("total_frames", "n_episodes", "n_sequences"):
+        if key in combined_info:
+            combined_info[key] = sum(meta.info.get(key, 0) for meta in metadata_list)
+
+    base.info = combined_info
+    return base
+
+
+def build_dataset(repo_ids: list[str], delta_timestamps, root, image_transforms):
+    datasets = []
+    for repo_id in repo_ids:
+        resolved_root = _resolve_local_repo_root(root, repo_id)
+        datasets.append(
+            LeRobotDataset(
+                repo_id,
+                delta_timestamps=delta_timestamps,
+                root=resolved_root,
+                image_transforms=image_transforms,
+            )
+        )
+    if len(datasets) == 1:
+        return datasets[0]
+    return ConcatDataset(datasets)
 
 
 
@@ -186,7 +280,8 @@ def main(cfg: DictConfig):
     writer = SummaryWriter(log_dir=str(output_directory)) if rank == 0 else None
 
     # Dataset metadata and features
-    dataset_metadata = LeRobotDatasetMetadata(cfg.repoid, root=cfg.root)
+    repo_ids = _normalize_repo_ids(cfg.repoid)
+    dataset_metadata = load_dataset_metadata(repo_ids, root=cfg.root)
     print("camera_keys:", dataset_metadata.camera_keys)
     print("Original dataset features:", dataset_metadata.features)
 
@@ -325,12 +420,7 @@ def main(cfg: DictConfig):
     delta_timestamps = build_delta_timestamps(dataset_metadata, policy_cfg)
 
     image_transforms = build_augmenter(cfg.training.RGB_Augmenter)
-    dataset = LeRobotDataset(
-        cfg.repoid,
-        delta_timestamps=delta_timestamps,
-        root=cfg.root,
-        image_transforms=image_transforms,
-    )
+    dataset = build_dataset(repo_ids, delta_timestamps, cfg.root, image_transforms)
 
     # Training loop
     sampler = None
