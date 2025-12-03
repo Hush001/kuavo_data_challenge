@@ -48,41 +48,6 @@ def _normalize_repo_ids(repoid: Any) -> list[str]:
     raise TypeError(f"Unsupported repoid type: {type(repoid)}")
 
 
-def _resolve_local_repo_root(root: str | Path | None, repo_id: str) -> Path | None:
-    """Resolve the on-disk root for a repo.
-
-    The upstream LeRobot loaders expect ``root`` to point at the directory
-    containing ``data``, ``images`` and ``meta``. When users keep multiple
-    shards together, they often set ``root`` to the parent directory (e.g.,
-    ``/ssdfs/.../1``) and place each shard under ``<root>/<repo_id>/lerobot``.
-
-    This helper searches a few common layouts and returns the first one that
-    contains ``meta/info.json``. If nothing exists locally, ``None`` is
-    returned so the default HuggingFace download path can be used instead.
-    """
-
-    if root is None:
-        return None
-
-    root = Path(root)
-    candidate_roots = [
-        root,
-        root / repo_id,
-        root / repo_id / "lerobot",
-    ]
-
-    info_relpath = Path("meta") / "info.json"
-    for candidate in candidate_roots:
-        if (candidate / info_relpath).exists():
-            return candidate
-
-    searched = [str(p) for p in candidate_roots]
-    raise FileNotFoundError(
-        f"Could not find meta/info.json for repo '{repo_id}'. Tried: {searched}. "
-        "If you intended to download from HuggingFace, leave `root` unset."
-    )
-
-
 def build_augmenter(cfg):
     """Since operations such as cropping and resizing in LeRobot are implemented at the model level 
     rather than at the data level, we provide only RGB image augmentations on the data side here, 
@@ -208,10 +173,7 @@ def build_policy_config(cfg, input_features, output_features):
 def load_dataset_metadata(repo_ids: list[str], root: str | Path | None):
     """Load and optionally merge metadata across multiple datasets."""
 
-    metadata_list = []
-    for repo_id in repo_ids:
-        resolved_root = _resolve_local_repo_root(root, repo_id)
-        metadata_list.append(LeRobotDatasetMetadata(repo_id, root=resolved_root))
+    metadata_list = [LeRobotDatasetMetadata(repo_id, root=root) for repo_id in repo_ids]
     if len(metadata_list) == 1:
         return metadata_list[0]
 
@@ -236,17 +198,15 @@ def load_dataset_metadata(repo_ids: list[str], root: str | Path | None):
 
 
 def build_dataset(repo_ids: list[str], delta_timestamps, root, image_transforms):
-    datasets = []
-    for repo_id in repo_ids:
-        resolved_root = _resolve_local_repo_root(root, repo_id)
-        datasets.append(
-            LeRobotDataset(
-                repo_id,
-                delta_timestamps=delta_timestamps,
-                root=resolved_root,
-                image_transforms=image_transforms,
-            )
+    datasets = [
+        LeRobotDataset(
+            repo_id,
+            delta_timestamps=delta_timestamps,
+            root=root,
+            image_transforms=image_transforms,
         )
+        for repo_id in repo_ids
+    ]
     if len(datasets) == 1:
         return datasets[0]
     return ConcatDataset(datasets)
